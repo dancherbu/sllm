@@ -4,18 +4,28 @@
 //! tokenizes it, and updates associative count tables in the brain.
 //!
 //! Usage:
-//!   sllm-train --data ./data/ --output ./models/model.sllm --name my-model
+//!   sllm-train --auto --data ./data/ --output ./models/brain.sllm --name sllm-v1
+//!   sllm-train --data ./data/twi/ --output ./models/twi.sllm --name twi-only
 //!   sllm-train --resume ./models/model.sllm --data ./more-data/
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::io::{BufRead, BufReader};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tracing::{info, warn};
 
 use sllm_core::brain::NgramBrain;
 use sllm_core::format::{BrainReader, BrainWriter};
 use sllm_core::tokenizer::{BpeTokenizer, BpeTrainer};
+
+mod curriculum;
+mod evaluator;
+mod progress;
+
+use curriculum::Curriculum;
+use progress::{PhaseStatus, ProgressWriter, TrainingStatus};
 
 /// sLLM Training Engine — gradient-free model trainer
 #[derive(Parser, Debug)]
@@ -30,15 +40,20 @@ struct Args {
     output: Option<PathBuf>,
 
     /// Model name (stored in the brain.sllm header)
-    #[arg(short, long, default_value = "sllm-base")]
+    #[arg(short, long, default_value = "sllm-v1")]
     name: String,
 
     /// Resume training from an existing model
     #[arg(short, long)]
     resume: Option<PathBuf>,
 
+    /// Fully autonomous training mode: runs all curriculum phases
+    /// until convergence with self-evaluation between phases.
+    #[arg(long)]
+    auto: bool,
+
     /// Target vocabulary size for BPE tokenizer
-    #[arg(long, default_value = "16384")]
+    #[arg(long, default_value = "22000")]
     vocab_size: usize,
 
     /// Maximum associations per n-gram table (0 = unlimited)
@@ -46,12 +61,16 @@ struct Args {
     max_associations: u64,
 
     /// Checkpoint interval (save every N files processed)
-    #[arg(long, default_value = "100")]
+    #[arg(long, default_value = "500")]
     checkpoint_interval: usize,
 
     /// Minimum count threshold for pruning during consolidation
     #[arg(long, default_value = "0")]
     prune_threshold: u32,
+
+    /// Maximum lines per phase to sample for tokenizer training
+    #[arg(long, default_value = "100000")]
+    tokenizer_sample_lines: usize,
 }
 
 fn main() -> Result<()> {
@@ -65,22 +84,277 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Determine output path
+    // Set up graceful shutdown on SIGINT/SIGTERM
+    let shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let shutdown = shutdown.clone();
+        ctrlc::set_handler(move || {
+            if shutdown.load(Ordering::Relaxed) {
+                // Second interrupt — force exit
+                std::process::exit(1);
+            }
+            info!("Received interrupt — saving checkpoint and exiting...");
+            shutdown.store(true, Ordering::Relaxed);
+        })
+        .expect("Failed to set Ctrl-C handler");
+    }
+
+    if args.auto {
+        run_autonomous(&args, &shutdown)
+    } else {
+        run_single_phase(&args, &shutdown)
+    }
+}
+
+/// Run fully autonomous multi-phase training.
+fn run_autonomous(args: &Args, shutdown: &Arc<AtomicBool>) -> Result<()> {
+    info!("═══════════════════════════════════════════════════════");
+    info!("  sLLM Autonomous Training");
+    info!("  Data: {}", args.data.display());
+    info!("  Vocab: {} tokens", args.vocab_size);
+    info!("═══════════════════════════════════════════════════════");
+
+    let output_path = args
+        .output
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("./models/brain.sllm"));
+
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Build curriculum
+    let curriculum = Curriculum::from_data_dir(&args.data);
+    let phase_names: Vec<&str> = curriculum.phase_names().into_iter().collect();
+
+    // Initialize progress tracker
+    let progress_dir = output_path.parent().unwrap_or(Path::new("."));
+    let mut progress = ProgressWriter::new(progress_dir, &args.name, &phase_names);
+
+    // Phase 0: Build tokenizer from sampled corpus
+    info!("════ Phase 0: Building BPE Tokenizer ════");
+    progress.progress_mut().status = TrainingStatus::Tokenizing;
+    progress.flush()?;
+
+    let (tokenizer, mut brain) = if let Some(ref resume_path) = args.resume {
+        info!("Resuming from: {}", resume_path.display());
+        let loaded = BrainReader::read_owned(resume_path)?;
+        info!(
+            "Loaded model '{}': {} associations, {} tokens",
+            loaded.header.model_name,
+            loaded.brain.total_associations(),
+            loaded.brain.tokens_trained()
+        );
+        (loaded.tokenizer, loaded.brain)
+    } else {
+        info!("Sampling corpus for tokenizer training...");
+        let samples = curriculum.collect_tokenizer_samples(args.tokenizer_sample_lines);
+
+        info!(
+            "Training BPE tokenizer (target vocab: {})...",
+            args.vocab_size
+        );
+        let trainer = BpeTrainer::new(args.vocab_size);
+        let tokenizer = trainer.train(samples.iter().map(|s| s.as_str()));
+        info!(
+            "Tokenizer built: {} tokens, {} merges",
+            tokenizer.vocab().len(),
+            tokenizer.num_merges()
+        );
+
+        let brain = NgramBrain::new(args.max_associations);
+        (tokenizer, brain)
+    };
+
+    progress.update_model_stats(
+        brain.total_associations(),
+        brain.tokens_trained(),
+        tokenizer.vocab().len(),
+    );
+    progress.flush()?;
+
+    // Train each curriculum phase
+    for (phase_idx, phase) in curriculum.phases.iter().enumerate() {
+        if shutdown.load(Ordering::Relaxed) {
+            info!("Shutdown requested — saving checkpoint");
+            save_checkpoint(&output_path, &args.name, &tokenizer, &brain)?;
+            progress.flush()?;
+            return Ok(());
+        }
+
+        info!("════ Phase {}: {} ════", phase_idx + 1, phase.name);
+
+        // Update progress
+        progress.progress_mut().current_phase_index = phase_idx;
+        progress.progress_mut().current_phase = phase.name.clone();
+        progress.start_phase();
+
+        // Set total files for this phase
+        let files = curriculum::list_text_files(&phase.data_path);
+        if let Some(pp) = progress.current_phase_mut() {
+            pp.total_files = files.len() as u64;
+            pp.max_epochs = phase.max_epochs;
+        }
+        progress.flush()?;
+
+        if files.is_empty() {
+            warn!("Phase '{}': no data files found, skipping", phase.name);
+            progress.advance_phase();
+            continue;
+        }
+
+        // Load test data for evaluation
+        let test_text = evaluator::load_test_data(&phase.data_path);
+
+        // Train for up to max_epochs
+        let mut previous_perplexity: Option<f64> = None;
+
+        for epoch in 0..phase.max_epochs {
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+
+            info!("  Epoch {}/{}", epoch + 1, phase.max_epochs);
+
+            // Update progress
+            if let Some(pp) = progress.current_phase_mut() {
+                pp.epoch = epoch + 1;
+                pp.files_processed = 0;
+            }
+
+            // Train on all files in this phase
+            train_on_files(
+                &files,
+                &tokenizer,
+                &mut brain,
+                &mut progress,
+                &output_path,
+                &args.name,
+                args.checkpoint_interval,
+                shutdown,
+            )?;
+
+            // Update stats
+            progress.update_model_stats(
+                brain.total_associations(),
+                brain.tokens_trained(),
+                tokenizer.vocab().len(),
+            );
+
+            // Evaluate
+            if !test_text.is_empty() {
+                progress.progress_mut().status = TrainingStatus::Evaluating;
+                if let Some(pp) = progress.current_phase_mut() {
+                    pp.status = PhaseStatus::Evaluating;
+                }
+                progress.flush()?;
+
+                let eval_result = evaluator::evaluate_phase(
+                    &brain,
+                    &tokenizer,
+                    &phase.name,
+                    &test_text,
+                    previous_perplexity,
+                );
+
+                // Record metrics
+                if let Some(pp) = progress.current_phase_mut() {
+                    pp.perplexity_history.push(eval_result.perplexity);
+                    pp.coverage_history.push(eval_result.coverage);
+                    pp.latest_perplexity = Some(eval_result.perplexity);
+                    pp.latest_coverage = Some(eval_result.coverage);
+                    if !eval_result.sample_generation.is_empty() {
+                        pp.sample_generation = Some(eval_result.sample_generation);
+                    }
+                }
+
+                previous_perplexity = Some(eval_result.perplexity);
+
+                // Check convergence
+                if eval_result.converged && epoch >= 1 {
+                    info!(
+                        "  ✓ Phase '{}' converged at epoch {}",
+                        phase.name,
+                        epoch + 1
+                    );
+                    break;
+                }
+            }
+
+            // Checkpoint after each epoch
+            info!("  Checkpointing...");
+            save_checkpoint(&output_path, &args.name, &tokenizer, &brain)?;
+            progress.progress_mut().status = TrainingStatus::Training;
+            progress.flush()?;
+        }
+
+        // Consolidation: prune if configured
+        if phase.prune_threshold > 0 {
+            info!("  Consolidating (prune threshold={})...", phase.prune_threshold);
+            progress.progress_mut().status = TrainingStatus::Consolidating;
+            progress.flush()?;
+
+            let before = brain.total_associations();
+            brain.prune_all(phase.prune_threshold);
+            let after = brain.total_associations();
+            info!(
+                "  Pruned {} associations ({} → {})",
+                before - after,
+                before,
+                after
+            );
+        }
+
+        // Mark phase complete
+        progress.advance_phase();
+        progress.update_model_stats(
+            brain.total_associations(),
+            brain.tokens_trained(),
+            tokenizer.vocab().len(),
+        );
+        progress.flush()?;
+
+        // Save after each phase
+        save_checkpoint(&output_path, &args.name, &tokenizer, &brain)?;
+    }
+
+    // Final save
+    info!("════ Training Complete ════");
+    info!(
+        "Model '{}': {} associations, {} tokens trained",
+        args.name,
+        brain.total_associations(),
+        brain.tokens_trained()
+    );
+    progress.mark_converged();
+
+    // Record final model size
+    if let Ok(meta) = std::fs::metadata(&output_path) {
+        progress.progress_mut().model.model_size_bytes = meta.len();
+    }
+    progress.flush()?;
+
+    info!("Saved to: {}", output_path.display());
+    info!("═══════════════════════════════════════════════════════");
+
+    Ok(())
+}
+
+/// Run a single training pass (non-autonomous mode).
+fn run_single_phase(args: &Args, shutdown: &Arc<AtomicBool>) -> Result<()> {
     let output_path = args
         .output
         .clone()
         .unwrap_or_else(|| PathBuf::from("./models/model.sllm"));
 
-    // Ensure output directory exists
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    // Load or create model
-    let (mut tokenizer, mut brain) = if let Some(ref resume_path) = args.resume {
+    let (tokenizer, mut brain) = if let Some(ref resume_path) = args.resume {
         info!("Resuming from: {}", resume_path.display());
-        let loaded = BrainReader::read_owned(resume_path)
-            .context("Failed to read existing model")?;
+        let loaded =
+            BrainReader::read_owned(resume_path).context("Failed to read existing model")?;
         info!(
             "Loaded model '{}': {} associations, {} tokens trained",
             loaded.header.model_name,
@@ -90,65 +364,47 @@ fn main() -> Result<()> {
         (loaded.tokenizer, loaded.brain)
     } else {
         info!("Creating new model '{}'", args.name);
-        info!("Building tokenizer from training data (vocab_size={})...", args.vocab_size);
+        info!(
+            "Building tokenizer from training data (vocab_size={})...",
+            args.vocab_size
+        );
 
-        // Build tokenizer from training data
         let text_iter = collect_text_files(&args.data)?;
         let trainer = BpeTrainer::new(args.vocab_size);
         let tokenizer = trainer.train(text_iter.iter().map(|s| s.as_str()));
-        info!("Tokenizer built: {} tokens, {} merges", tokenizer.vocab().len(), tokenizer.num_merges());
+        info!(
+            "Tokenizer built: {} tokens, {} merges",
+            tokenizer.vocab().len(),
+            tokenizer.num_merges()
+        );
 
         let brain = NgramBrain::new(args.max_associations);
         (tokenizer, brain)
     };
 
-    // Train on data files
-    let files = list_text_files(&args.data)?;
+    let files = curriculum::list_text_files(&args.data);
     info!("Found {} training files", files.len());
 
-    let mut files_processed = 0u64;
-    let start_time = std::time::Instant::now();
-
-    for (i, file_path) in files.iter().enumerate() {
-        let text = match std::fs::read_to_string(file_path) {
-            Ok(t) => t,
-            Err(e) => {
-                warn!("Skipping {}: {}", file_path.display(), e);
-                continue;
-            }
-        };
-
-        // Tokenize and train
-        let tokens = tokenizer.encode(&text);
-        if tokens.len() >= 5 {
-            brain.train_sequence(&tokens);
-        }
-
-        files_processed += 1;
-
-        // Progress logging
-        if files_processed % 50 == 0 {
-            let elapsed = start_time.elapsed().as_secs_f64();
-            let rate = files_processed as f64 / elapsed;
-            info!(
-                "[{}/{}] {} associations | {} tokens trained | {:.1} files/sec",
-                i + 1,
-                files.len(),
-                brain.total_associations(),
-                brain.tokens_trained(),
-                rate,
-            );
-        }
-
-        // Checkpoint
-        if args.checkpoint_interval > 0 && files_processed as usize % args.checkpoint_interval == 0
-        {
-            info!("Checkpointing to {}...", output_path.display());
-            BrainWriter::write(&output_path, &args.name, &tokenizer, &brain)?;
-        }
+    let progress_dir = output_path.parent().unwrap_or(Path::new("."));
+    let mut progress = ProgressWriter::new(progress_dir, &args.name, &["Single Phase"]);
+    progress.start_phase();
+    if let Some(pp) = progress.current_phase_mut() {
+        pp.total_files = files.len() as u64;
     }
+    progress.flush()?;
 
-    // Consolidation pass (prune low-count associations)
+    train_on_files(
+        &files,
+        &tokenizer,
+        &mut brain,
+        &mut progress,
+        &output_path,
+        &args.name,
+        args.checkpoint_interval,
+        shutdown,
+    )?;
+
+    // Consolidation
     if args.prune_threshold > 0 {
         let before = brain.total_associations();
         brain.prune_all(args.prune_threshold);
@@ -163,20 +419,131 @@ fn main() -> Result<()> {
     // Final save
     info!("Saving model to {}...", output_path.display());
     BrainWriter::write(&output_path, &args.name, &tokenizer, &brain)?;
+    progress.mark_converged();
+    progress.flush()?;
 
-    let elapsed = start_time.elapsed();
     info!(
-        "Training complete: {} files, {} associations, {} tokens in {:.1}s",
-        files_processed,
+        "Training complete: {} associations, {} tokens",
         brain.total_associations(),
         brain.tokens_trained(),
-        elapsed.as_secs_f64(),
     );
 
     Ok(())
 }
 
-/// Collect all text from files for tokenizer training.
+/// Train the brain on a list of files, updating progress.
+fn train_on_files(
+    files: &[PathBuf],
+    tokenizer: &BpeTokenizer,
+    brain: &mut NgramBrain,
+    progress: &mut ProgressWriter,
+    output_path: &Path,
+    model_name: &str,
+    checkpoint_interval: usize,
+    shutdown: &Arc<AtomicBool>,
+) -> Result<()> {
+    let start_time = std::time::Instant::now();
+    let mut files_this_pass = 0u64;
+    let mut lines_this_pass = 0u64;
+
+    for (i, file_path) in files.iter().enumerate() {
+        if shutdown.load(Ordering::Relaxed) {
+            info!("Shutdown requested — checkpointing...");
+            save_checkpoint(output_path, model_name, tokenizer, brain)?;
+            return Ok(());
+        }
+
+        // Stream file line-by-line to avoid loading huge files
+        let file = match std::fs::File::open(file_path) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!("Skipping {}: {}", file_path.display(), e);
+                continue;
+            }
+        };
+
+        let reader = std::io::BufReader::new(file);
+        let mut file_tokens = Vec::new();
+
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let tokens = tokenizer.encode(trimmed);
+            file_tokens.extend_from_slice(&tokens);
+            lines_this_pass += 1;
+
+            // Train in chunks to avoid massive single sequences
+            if file_tokens.len() >= 512 {
+                brain.train_sequence(&file_tokens);
+                file_tokens.clear();
+            }
+        }
+
+        // Train remaining tokens
+        if file_tokens.len() >= 5 {
+            brain.train_sequence(&file_tokens);
+        }
+
+        files_this_pass += 1;
+
+        // Update progress
+        if let Some(pp) = progress.current_phase_mut() {
+            pp.files_processed = files_this_pass;
+            pp.lines_processed = lines_this_pass;
+            pp.tokens_trained = brain.tokens_trained();
+        }
+
+        // Progress logging
+        if files_this_pass % 50 == 0 || i == files.len() - 1 {
+            let elapsed = start_time.elapsed().as_secs_f64();
+            let rate = files_this_pass as f64 / elapsed;
+            let eta_secs = if rate > 0.0 {
+                (files.len() as f64 - files_this_pass as f64) / rate
+            } else {
+                0.0
+            };
+            info!(
+                "  [{}/{}] {} assoc | {} tokens | {:.1} files/s | ETA {:.0}s",
+                files_this_pass,
+                files.len(),
+                brain.total_associations(),
+                brain.tokens_trained(),
+                rate,
+                eta_secs,
+            );
+            progress.flush()?;
+        }
+
+        // Checkpoint
+        if checkpoint_interval > 0 && files_this_pass as usize % checkpoint_interval == 0 {
+            info!("  Checkpointing...");
+            save_checkpoint(output_path, model_name, tokenizer, brain)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Save a checkpoint of the current model.
+fn save_checkpoint(
+    output_path: &Path,
+    model_name: &str,
+    tokenizer: &BpeTokenizer,
+    brain: &NgramBrain,
+) -> Result<()> {
+    BrainWriter::write(output_path, model_name, tokenizer, brain)?;
+    Ok(())
+}
+
+/// Collect all text from files for tokenizer training (single-phase mode).
 fn collect_text_files(path: &Path) -> Result<Vec<String>> {
     let mut texts = Vec::new();
 
@@ -184,9 +551,9 @@ fn collect_text_files(path: &Path) -> Result<Vec<String>> {
         let text = std::fs::read_to_string(path)?;
         texts.push(text);
     } else if path.is_dir() {
-        for entry in walkdir(path)? {
+        for entry in curriculum::list_text_files(path) {
             if let Ok(text) = std::fs::read_to_string(&entry) {
-                // Limit per-file text for tokenizer training to avoid memory issues
+                // Limit per-file text for tokenizer training
                 if text.len() < 1_000_000 {
                     texts.push(text);
                 }
@@ -195,56 +562,4 @@ fn collect_text_files(path: &Path) -> Result<Vec<String>> {
     }
 
     Ok(texts)
-}
-
-/// List all text/code files in a path recursively.
-fn list_text_files(path: &Path) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-
-    if path.is_file() {
-        files.push(path.to_path_buf());
-    } else if path.is_dir() {
-        files = walkdir(path)?;
-    }
-
-    Ok(files)
-}
-
-/// Recursively walk a directory and return all file paths.
-fn walkdir(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-
-    fn walk_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-        let entries = std::fs::read_dir(dir)?;
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                // Skip hidden directories and common non-text dirs
-                let name = path.file_name().unwrap_or_default().to_string_lossy();
-                if !name.starts_with('.') && name != "node_modules" && name != "target" && name != "__pycache__" {
-                    walk_recursive(&path, files)?;
-                }
-            } else if path.is_file() {
-                // Filter by common text/code extensions
-                if let Some(ext) = path.extension() {
-                    let ext = ext.to_string_lossy().to_lowercase();
-                    if matches!(
-                        ext.as_str(),
-                        "txt" | "md" | "py" | "rs" | "js" | "ts" | "jsx" | "tsx"
-                            | "c" | "h" | "cpp" | "hpp" | "go" | "java" | "rb"
-                            | "sh" | "bash" | "zsh" | "toml" | "yaml" | "yml"
-                            | "json" | "html" | "css" | "sql"
-                    ) {
-                        files.push(path);
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    walk_recursive(dir, &mut files)?;
-    files.sort();
-    Ok(files)
 }

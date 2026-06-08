@@ -1,0 +1,29 @@
+[Unit]
+Description=sLLM Autonomous Training Engine
+Documentation=https://github.com/dancherbu/sllm
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/dancherbu/Projects/sllm/target/release/sllm-train \
+    --auto \
+    --data /home/dancherbu/Projects/sllm/data \
+    --output /home/dancherbu/Projects/sllm/models/brain.sllm \
+    --name sllm-v1
+Restart=on-failure
+RestartSec=30
+WorkingDirectory=/home/dancherbu/Projects/sllm
+User=dancherbu
+Environment=RUST_LOG=sllm_train=info
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=50G
+Nice=10
+
+# Logging
+StandardOutput=append:/home/dancherbu/Projects/sllm/models/training.log
+StandardError=append:/home/dancherbu/Projects/sllm/models/training.log
+
+[Install]
+WantedBy=multi-user.target

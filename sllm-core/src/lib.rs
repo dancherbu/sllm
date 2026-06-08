@@ -3,10 +3,11 @@
 //! The shared library for the sLLM (shallow Large Language Model) system.
 //!
 //! This crate provides:
-//! - **Tokenizer**: BPE tokenizer with code-aware splitting (16k vocab)
+//! - **Tokenizer**: BPE tokenizer with code-aware splitting (20k-24k multilingual vocab)
 //! - **Brain**: Hebbian associative count tables (zero calculus, gradient-free)
 //! - **Format**: `brain.sllm` binary file format (mmap-compatible)
 //! - **RAG**: Retrieval-Augmented Generation index and retrieval
+//! - **Eval**: Perplexity, generation, and convergence metrics
 //!
 //! ## Philosophy
 //!
@@ -15,6 +16,7 @@
 //! no backpropagation, no floating-point weights.
 
 pub mod brain;
+pub mod eval;
 pub mod format;
 pub mod rag;
 pub mod tokenizer;
@@ -26,7 +28,7 @@ pub const SLLM_MAGIC: &[u8; 4] = b"SLLM";
 pub const SLLM_VERSION: u16 = 1;
 
 /// Default vocabulary size for the BPE tokenizer.
-pub const DEFAULT_VOCAB_SIZE: u32 = 16_384;
+pub const DEFAULT_VOCAB_SIZE: u32 = 22_000;
 
 /// Default context window size (number of tokens for n-gram lookups).
 pub const DEFAULT_CONTEXT_WINDOW: u32 = 128;
