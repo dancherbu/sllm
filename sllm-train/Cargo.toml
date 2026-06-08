@@ -1,0 +1,19 @@
+[package]
+name = "sllm-train"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "sLLM Training Engine — Streaming, gradient-free model trainer"
+
+[[bin]]
+name = "sllm-train"
+path = "src/main.rs"
+
+[dependencies]
+sllm-core.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rayon.workspace = true
+rand.workspace = true

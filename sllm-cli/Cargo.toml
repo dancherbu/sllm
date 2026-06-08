@@ -1,0 +1,22 @@
+[package]
+name = "sllm-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "sLLM CLI — Unified command-line tool for sLLM management"
+
+[[bin]]
+name = "sllm"
+path = "src/main.rs"
+
+[dependencies]
+sllm-core.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rayon.workspace = true
+rand.workspace = true

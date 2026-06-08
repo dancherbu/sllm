@@ -1,0 +1,17 @@
+[package]
+name = "sllm-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "sLLM Core — Tokenizer, associative brain, file format, and RAG engine"
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+byteorder.workspace = true
+crc32fast.workspace = true
+memmap2.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

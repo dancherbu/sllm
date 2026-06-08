@@ -1,0 +1,24 @@
+# Generated files
+/target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model files (large)
+*.sllm
+models/*.sllm
+
+# Training data (large)
+data/*
+!data/.gitkeep
+
+# SQLite databases
+*.db
+*.sqlite
