@@ -471,7 +471,8 @@ def render_with_build(project_root: Path):
         wstr = f" ({build['warnings']} warnings)" if build["warnings"] > 0 else ""
         print(f"  {C.ok(f'cargo check{wstr}')}")
     else:
-        print(f"  {C.err(f'cargo check: {build[\"check\"]}')}")
+        check_val = build["check"]
+        print(f"  {C.err(f'cargo check: {check_val}')}")
     tstr = build.get("test", "unknown")
     if "0 failed" in str(tstr) or ("passed" in str(tstr) and "FAILED" not in str(tstr)):
         print(f"  {C.ok(tstr)}")
