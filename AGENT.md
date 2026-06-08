@@ -40,14 +40,14 @@ The model is designed for **edge deployment**: train on a laptop CPU, run on a p
 ├─────────────────────────────────────────────────────────────┤
 │                                                              │
 │  sllm-core (library)                                        │
-│  ├── tokenizer/   — BPE tokenizer (16k vocab, code-aware)   │
+│  ├── tokenizer/   — BPE tokenizer (20k-24k vocab, multilingual)│
 │  ├── brain/       — Associative count tables + Count-Min     │
 │  ├── format/      — brain.sllm binary file format            │
 │  └── rag/         — BM25 + SQLite retrieval index            │
 │                                                              │
 │  sllm-train (binary) — Read+Write training engine            │
 │  ├── Streaming data pipeline (line-by-line, never full load) │
-│  ├── Phased curriculum (English → Code → Agentic)            │
+│  ├── Phased curriculum (Twi → English → Code → Personal)     │
 │  └── Consolidation / "sleep" pass (prune + compact)          │
 │                                                              │
 │  sllm-run (binary) — Read-only inference runner              │
@@ -118,11 +118,23 @@ At inference:
 ```
 sllm/
 ├── AGENT.md              ← YOU ARE HERE
+├── DECISIONS.md          — All design decisions from each session
 ├── README.md             — Project overview and quickstart
 ├── FEATURES.md           — Feature roadmap with current/planned/future
 ├── Cargo.toml            — Workspace manifest
 ├── models/               — Default model storage
-├── data/                 — Training data
+├── data/                 — Training data (gitignored)
+│   ├── twi/              — Ashanti Twi text datasets
+│   ├── english/          — TinyStories + Simple Wikipedia
+│   ├── code/             — The Stack Processed V2 subsets
+│   ├── personal/         — Symlinks to ~/Projects/
+│   └── bootstrap/        — GPT-2 vocab, n-gram frequencies
+├── scripts/              — Python data acquisition & monitoring
+│   ├── download_twi.py   — Download 9 Twi datasets from HuggingFace
+│   ├── download_english.py — TinyStories + Wikipedia
+│   ├── download_code.py  — The Stack code subsets
+│   ├── prepare_personal.py — Extract personal code from ~/Projects/
+│   └── monitor.py        — Training & development dashboard
 ├── sllm-core/            — Shared library
 ├── sllm-train/           — Training engine binary
 ├── sllm-run/             — Inference runner binary
@@ -190,13 +202,21 @@ sllm/
 
 ## Training Data Strategy
 
-| Phase | Dataset | Purpose |
-|-------|---------|---------|
-| Ashanti Twi | Ghana-NLP Bible + parallel corpora + tweets | First language — Akan Twi patterns |
-| English | TinyStories, Gutenberg, Simple Wikipedia | Basic language patterns, vocabulary |
-| Code (public) | The Stack Processed V2 (TS, Python, JS, Rust) | Generic code patterns |
-| Code (personal) | ~/Projects/ codebases | YOUR naming conventions, YOUR patterns |
-| Agentic | Synthetic trajectories (think→plan→code→test) | Multi-step reasoning patterns |
+| Phase | Dataset | Status | Purpose |
+|-------|---------|--------|---------|
+| 0. Ashanti Twi | 9 datasets from ghananlpcommunity (HF) | ✅ Downloaded | First language — Akan Twi patterns |
+| 1. English | TinyStories (2.1M stories) + Simple Wikipedia (509k lines) | ✅ Downloaded | English fluency foundation — **expand over time** |
+| 2. Code (public) | The Stack Processed V2 (Python, TS, JS, Rust) | 🔵 Downloading | Generic code patterns |
+| 3. Code (personal) | ~/Projects/ (20,524 files, 4.5M lines) | ✅ Extracted | YOUR naming conventions, YOUR patterns |
+| 4. Agentic | Synthetic trajectories (think→plan→code→test) | ⚪ Future | Multi-step reasoning patterns |
+
+### English Fluency — Long-Term Plan
+
+The sLLM must learn **full English fluency over time**. Current corpus is a starting point:
+1. ✅ Phase 1: TinyStories + Wikipedia (basic patterns)
+2. Future: Project Gutenberg (literature), OpenWebText (web), DailyDialog (conversation)
+3. Future: Technical docs (man pages, READMEs, API docs)
+4. Continuous incremental training — add more data without restarting
 
 ---
 
@@ -209,14 +229,31 @@ sllm/
 5. **Memory efficiency**: Count-Min Sketch available but skipped during training (64GB RAM = full exact counts)
 6. **Runner API**: Custom REST API on port 11435 (multi-model, streaming)
 7. **RAG**: BM25 via tantivy + SQLite snippet store
-8. **Primary languages**: TypeScript, Python, JavaScript/JSX, Rust, SQL, Shell
+8. **Primary languages**: TypeScript, Python, JavaScript/JSX, Rust, Shell (SQL deferred until SQL training phase)
 
 ---
 
 ## How to Resume Work
 
-1. Read this file (AGENT.md)
-2. Check FEATURES.md for the full feature list and what's done
-3. Check the Current Status table above
-4. Run `cargo test --workspace` to verify everything compiles
-5. Continue from the next incomplete phase
+1. Read this file (`AGENT.md`) — project philosophy, constraints, architecture
+2. Read `DECISIONS.md` — all design decisions and session context
+3. Check `FEATURES.md` for the full feature list and what's done
+4. Check the Current Status table above
+5. Run `python3 scripts/monitor.py --full` — see data/model/build status at a glance
+6. Run `cargo test --workspace` to verify everything compiles
+7. Continue from the next incomplete phase
+
+### Quick Monitor Commands
+
+```bash
+python3 scripts/monitor.py           # One-shot status dashboard
+python3 scripts/monitor.py --watch   # Live refreshing (5s interval)
+python3 scripts/monitor.py --full    # Include cargo check + test results
+python3 scripts/monitor.py --json    # Machine-readable output
+```
+
+### GitHub
+
+- **Repo**: [github.com/dancherbu/sllm](https://github.com/dancherbu/sllm) (public)
+- **Branch protection**: `master` requires 1 PR review, admin self-approval enabled
+- **Local path**: `~/Projects/sllm/`

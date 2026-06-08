@@ -129,6 +129,13 @@ def download_dataset(ds_info: dict, output_dir: Path, dry_run: bool = False):
             print(f"  ✗ No text column found in {ds_id}. Columns: {cols}")
             return 0
 
+    # Select only text columns to avoid decoding audio/image features
+    keep_cols = [c for c in [text_col] + extra_cols if c in cols]
+    try:
+        ds = ds.select_columns(keep_cols)
+    except Exception:
+        pass  # Older datasets lib may not have select_columns
+
     seen = set()
     line_count = 0
 
