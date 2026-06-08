@@ -72,7 +72,6 @@ def download_stack_processed(
                 "vinsblack/The_Stack_Processed-v2",
                 split="train",
                 streaming=True,
-                trust_remote_code=True,
             )
 
             file_count = 0
