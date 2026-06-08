@@ -22,3 +22,7 @@ data/*
 # SQLite databases
 *.db
 *.sqlite
+
+# Python venv
+.venv/
+__pycache__/

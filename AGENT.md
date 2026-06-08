@@ -137,9 +137,9 @@ sllm/
 
 | Phase | Status | Description |
 |-------|--------|-------------|
-| Phase 1: Foundation | 🔵 IN PROGRESS | Cargo workspace, file format, tokenizer, basic count tables |
-| Phase 2: Training Pipeline | ⚪ NOT STARTED | Streaming pipeline, curriculum, consolidation |
-| Phase 3: Inference Runner | ⚪ NOT STARTED | mmap loader, HTTP API, model registry |
+| Phase 1: Foundation | ✅ COMPLETE | Cargo workspace, file format, tokenizer, count tables, runner, CLI |
+| Phase 2: Training Pipeline | 🔵 IN PROGRESS | Data acquisition, streaming pipeline, curriculum |
+| Phase 3: Inference Runner | ⚪ NOT STARTED | SSE streaming, stop sequences, model unload |
 | Phase 4: RAG + CLI | ⚪ NOT STARTED | BM25 index, retrieval, unified CLI |
 | Phase 5: HDC Projections | ⚪ NOT STARTED | Hyperdimensional Computing upgrade |
 | Phase 6: Contrastive Learning | ⚪ NOT STARTED | Forward-Forward style learning |
@@ -175,26 +175,41 @@ sllm/
 
 ---
 
+## Development Machine
+
+| Component | Spec |
+|-----------|------|
+| CPU | AMD Ryzen 9 9955HX (Zen 5) — 16C/32T @ 4.56GHz |
+| RAM | 64 GB DDR5 |
+| Storage | 1TB NVMe SSD (510GB free) |
+| GPU | RTX 3090 24GB — **intentionally unused** (no CUDA, no gradients) |
+| OS | Linux x86_64 |
+| Rust | 1.96.0+ |
+
+---
+
 ## Training Data Strategy
 
 | Phase | Dataset | Purpose |
 |-------|---------|---------|
-| English | TinyStories, Project Gutenberg | Basic language patterns, vocabulary |
-| Code Syntax | Python stdlib, TypeScript libs, Rust std | Keywords, brackets, indentation |
-| Code Semantics | Popular GitHub repos (clean, well-commented) | Functions, classes, modules |
+| Ashanti Twi | Ghana-NLP Bible + parallel corpora + tweets | First language — Akan Twi patterns |
+| English | TinyStories, Gutenberg, Simple Wikipedia | Basic language patterns, vocabulary |
+| Code (public) | The Stack Processed V2 (TS, Python, JS, Rust) | Generic code patterns |
+| Code (personal) | ~/Projects/ codebases | YOUR naming conventions, YOUR patterns |
 | Agentic | Synthetic trajectories (think→plan→code→test) | Multi-step reasoning patterns |
 
 ---
 
 ## Key Technical Decisions
 
-1. **Tokenizer**: BPE with 16,384 tokens, code-aware (preserves indentation, operators)
+1. **Tokenizer**: BPE with 20k–24k tokens, **multilingual** (English + Ashanti Twi + code-aware)
 2. **Context window**: 128 tokens (sliding window for n-gram lookups)
 3. **N-gram orders**: 2 through 5 simultaneously, interpolation-weighted
 4. **Count storage**: HashMap during training → sorted arrays in .sllm file
-5. **Memory efficiency**: Count-Min Sketch for lower-order n-grams
+5. **Memory efficiency**: Count-Min Sketch available but skipped during training (64GB RAM = full exact counts)
 6. **Runner API**: Custom REST API on port 11435 (multi-model, streaming)
 7. **RAG**: BM25 via tantivy + SQLite snippet store
+8. **Primary languages**: TypeScript, Python, JavaScript/JSX, Rust, SQL, Shell
 
 ---
 
